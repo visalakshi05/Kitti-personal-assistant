@@ -177,44 +177,47 @@ def _is_time_query(message: str) -> bool:
     time_keywords = ["time", "date", "day", "today", "now"]
     return any(kw in message_lower for kw in time_keywords) and len(message.split()) < 8
 
-def _verify_file_operation(code: str, result: str) -> str | None:
+def _verify_file_operation(code: str, result: str, all_results: list = None) -> str | None:
     import re
     desktop = os.path.expanduser("~/Desktop")
-    rename_match = re.search(r'shutil\.move\([^,]+,\s*["\']([^"\']+)["\']\)', code)
-    if rename_match:
-        target = os.path.join(desktop, rename_match.group(1).replace("/", "\\"))
-        if os.path.exists(target):
-            return f"Renamed to {os.path.basename(target)}"
-        return None
-    if "os.remove" in code or "shutil.rmtree" in code:
-        delete_match = re.search(r'os\.remove\(["\']([^"\']+)["\']\)', code)
-        if delete_match:
-            fname = delete_match.group(1).replace("/", "\\")
-            if not os.path.exists(os.path.join(desktop, fname)):
-                return f"Deleted {fname}"
-            return None
-    patterns = [
-        (r'openpyxl\.Workbook\(\)\.save\(["\']([^"\']+\.xlsx)', ".xlsx"),
-        (r'docx\.Document\(\)\.save\(["\']([^"\']+\.docx)', ".docx"),
-        (r'pptx\.Presentation\(\)\.save\(["\']([^"\']+\.pptx)', ".pptx"),
-        (r'reportlab', ".pdf"),
-    ]
-    for pat, _ in patterns:
-        m = re.search(pat, code)
-        if m:
-            fname = m.group(1).replace("/", "\\")
-            if os.path.exists(os.path.join(desktop, fname)):
-                return f"Created {fname}"
-            return None
-    if "win32com" in code and "ExportAsFixedFormat" in code:
-        pm = re.search(r'["\']([^"\']+\.pdf)["\']', code)
-        if pm:
-            fname = pm.group(1).replace("/", "\\")
-            if os.path.exists(os.path.join(desktop, fname)):
-                return f"Exported to PDF: {fname}"
-            return None
-    if "error" not in result.lower() and ("success" in result.lower() or "created" in result.lower()):
-        return result
+    results_to_check = all_results if all_results else [result]
+
+    # Detect if this is a delete operation
+    is_delete = "os.remove" in code or "shutil.rmtree" in code or "delete" in code.lower()
+
+    # Look for file paths in the code or results
+    file_pattern = re.compile(r'([A-Za-z_0-9\-]+\.(xlsx|docx|pptx|pdf))', re.IGNORECASE)
+
+    found_files = []
+    for src in [code] + results_to_check:
+        matches = file_pattern.findall(src)
+        for m in matches:
+            found_files.append(m[0])
+
+    # Remove duplicates and normalize
+    found_files = list(dict.fromkeys(found_files))
+
+    for fname in found_files:
+        # Normalize path separators
+        normalized = fname.replace("/", "\\").replace("\\\\", "\\")
+        full_path = os.path.join(desktop, os.path.basename(normalized))
+
+        if is_delete:
+            # For delete: file must NOT exist
+            if not os.path.exists(full_path):
+                return f"Deleted {os.path.basename(normalized)}"
+        else:
+            # For save/create: file must exist
+            if os.path.exists(full_path):
+                return f"Created {os.path.basename(normalized)}"
+
+    # Fallback: check result text for success without errors
+    for res in results_to_check:
+        res_lower = res.lower()
+        if "error" not in res_lower and "traceback" not in res_lower:
+            if "success" in res_lower or "created" in res_lower or "saved" in res_lower:
+                return res.strip()[:80]
+
     return None
 
 def chat_with_kitti(user_message: str) -> str:
@@ -280,14 +283,20 @@ def chat_with_kitti(user_message: str) -> str:
             for call in tool_calls:
                 if call.name == "run_code":
                     last_code = call.input.get("code", "")
-            for res in tool_results:
-                verified = _verify_file_operation(last_code or "", res["content"])
-                if verified:
-                    final_reply = f"Done! {verified} on your Desktop."
-                    chat_history.append({"role": "user", "content": user_message})
-                    chat_history.append({"role": "assistant", "content": final_reply})
-                    save_memory()
-                    return final_reply
+
+            all_results = [res["content"] for res in tool_results]
+            last_code = None
+            for call in tool_calls:
+                if call.name == "run_code":
+                    last_code = call.input.get("code", "")
+
+            verified = _verify_file_operation(last_code or "", "", all_results)
+            if verified:
+                final_reply = f"Done! {verified} on your Desktop."
+                chat_history.append({"role": "user", "content": user_message})
+                chat_history.append({"role": "assistant", "content": final_reply})
+                save_memory()
+                return final_reply
 
             assistant_content = []
             for block in response.content:
