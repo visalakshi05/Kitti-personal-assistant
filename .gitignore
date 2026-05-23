@@ -1,0 +1,21 @@
+# Python
+backend/venv/
+backend/__pycache__/
+**/__pycache__/
+*.pyc
+
+# Env
+backend/.env
+.env
+
+# Audio files
+backend/received_audio/
+
+# Memory/cache
+backend/memory/
+
+# Node
+frontend/node_modules/
+
+# VS Code
+.vscode/

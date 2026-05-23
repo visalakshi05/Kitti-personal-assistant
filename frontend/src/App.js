@@ -1,0 +1,276 @@
+import { useState, useEffect, useRef, useCallback } from 'react';
+import { MicVAD } from "@ricky0123/vad-web";
+import './App.css';
+
+function App() {
+  const [backendStatus, setBackendStatus] = useState("checking...");
+  const [appState, setAppState] = useState("starting"); // starting | listening | speaking | processing | denied
+  const [message, setMessage] = useState("");
+  const [transcript, setTranscript] = useState("");
+  const [response, setResponse] = useState("");
+
+  const websocketRef = useRef(null);
+  const vadRef = useRef(null);
+  const currentAudioRef = useRef(null);   // tracks currently playing audio
+  const isRespondingRef = useRef(false);  // true while Kitti is speaking aloud
+
+  // Health check
+  useEffect(() => {
+    fetch("http://localhost:8000/health")
+      .then((res) => res.json())
+      .then((data) => setBackendStatus(data.status))
+      .catch(() => setBackendStatus("backend not reachable"));
+  }, []);
+
+  // WebSocket setup
+  useEffect(() => {
+    const ws = new WebSocket("ws://localhost:8000/ws");
+    ws.onopen = () => console.log("WebSocket connected");
+    ws.onmessage = (event) => {
+      // Audio bytes come as Blob, text messages come as string
+      if (event.data instanceof Blob) {
+        // Stop any currently playing audio first
+        if (currentAudioRef.current) {
+          currentAudioRef.current.pause();
+          currentAudioRef.current = null;
+        }
+
+        const audioUrl = URL.createObjectURL(event.data);
+        const audio = new Audio(audioUrl);
+        currentAudioRef.current = audio;
+
+        audio.play();
+        isRespondingRef.current = true;   // 🔒 lock — Kitti is speaking
+        setAppState("responding");
+
+        audio.onended = () => {
+          URL.revokeObjectURL(audioUrl);
+          currentAudioRef.current = null;
+          isRespondingRef.current = false; // 🔓 unlock — Kitti finished
+          setAppState("listening");
+        };
+        return;
+      }
+
+      try {
+        const data = JSON.parse(event.data);
+        if (data.type === "transcript") {
+          setTranscript(data.text || "(no speech detected)");
+          setResponse("");
+        } else if (data.type === "response") {
+          setResponse(data.text);
+          // stay in "processing" until audio arrives and plays
+        } else if (data.type === "error") {
+          setMessage(data.text);
+          setAppState("listening");
+          setTimeout(() => setMessage(""), 2000);
+        }
+      } catch {
+        console.log("Backend says:", event.data);
+      }
+    };
+    ws.onclose = () => console.log("WebSocket disconnected");
+    ws.onerror = (err) => console.error("WebSocket error:", err);
+    websocketRef.current = ws;
+    return () => ws.close();
+  }, []);
+
+  // Convert Float32Array audio (from VAD) to WAV blob
+  const float32ToWav = useCallback((audioData, sampleRate = 16000) => {
+    const buffer = new ArrayBuffer(44 + audioData.length * 2);
+    const view = new DataView(buffer);
+
+    // WAV header
+    const writeString = (offset, str) => {
+      for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i));
+    };
+
+    writeString(0, "RIFF");
+    view.setUint32(4, 36 + audioData.length * 2, true);
+    writeString(8, "WAVE");
+    writeString(12, "fmt ");
+    view.setUint32(16, 16, true);
+    view.setUint16(20, 1, true);
+    view.setUint16(22, 1, true);
+    view.setUint32(24, sampleRate, true);
+    view.setUint32(28, sampleRate * 2, true);
+    view.setUint16(32, 2, true);
+    view.setUint16(34, 16, true);
+    writeString(36, "data");
+    view.setUint32(40, audioData.length * 2, true);
+
+    // PCM samples
+    let offset = 44;
+    for (let i = 0; i < audioData.length; i++) {
+      const s = Math.max(-1, Math.min(1, audioData[i]));
+      view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+      offset += 2;
+    }
+
+    return new Blob([buffer], { type: "audio/wav" });
+  }, []);
+
+  // Init VAD on page load
+  useEffect(() => {
+    const initVAD = async () => {
+      try {
+        // Tell VAD where to find model + worklet (we copied them to /public/)
+        const vad = await MicVAD.new({
+          baseAssetPath: "/",
+          onnxWASMBasePath: "/",
+          model: "legacy",
+
+          onSpeechStart: () => {
+            // Stop Kitti's audio if she is speaking
+            if (currentAudioRef.current) {
+              currentAudioRef.current.pause();
+              currentAudioRef.current = null;
+              console.log("Kitti interrupted by user!");
+            }
+            isRespondingRef.current = false;
+
+            // Clear previous transcript/response so UI feels fresh
+            setTranscript("");
+            setResponse("");
+            setAppState("speaking");
+          },
+          onSpeechEnd: (audio) => {
+            // If Kitti is still speaking, ignore this detection (it's her own voice)
+            if (isRespondingRef.current) {
+              console.log("Ignored — Kitti is speaking");
+              return;
+            }
+            console.log("Speech ended, samples:", audio.length);
+            setAppState("processing");
+
+            const wavBlob = float32ToWav(audio);
+            wavBlob.arrayBuffer().then((buffer) => {
+              if (websocketRef.current?.readyState === WebSocket.OPEN) {
+                websocketRef.current.send(buffer);
+              }
+            });
+          },
+          onVADMisfire: () => {
+            console.log("VAD misfire (too short)");
+            setAppState("listening");
+          },
+
+          positiveSpeechThreshold: 0.65,  // need higher confidence to count as speech start
+          negativeSpeechThreshold: 0.3,   // lower bar to declare silence
+          redemptionFrames: 40,           // ~1.3s — won't split on natural pauses in sentences
+          minSpeechFrames: 6,             // ignore brief blips
+          preSpeechPadFrames: 5,          // grab a bit before speech starts (avoids clipping first word)
+        });
+
+        vad.start();
+        vadRef.current = vad;
+        setAppState("listening");
+      } catch (err) {
+        console.error("VAD init failed:", err);
+        setAppState("denied");
+        setMessage(err.message || String(err));
+      }
+    };
+
+    initVAD();
+
+    return () => {
+      vadRef.current?.destroy();
+    };
+  }, [float32ToWav]);
+
+  return (
+    <div className="min-h-screen bg-gradient-to-b from-gray-950 via-gray-900 to-black flex flex-col items-center justify-center text-white relative overflow-hidden">
+
+      {/* Title */}
+      <div className="absolute top-12 text-center">
+        <h1 className="text-5xl font-bold tracking-[0.3em] text-indigo-300">
+          KITTI
+        </h1>
+        <p className="text-gray-600 text-xs mt-2 tracking-[0.4em] uppercase">
+          Your Personal Assistant
+        </p>
+      </div>
+
+      {/* Animated Orb */}
+      <div className="relative flex items-center justify-center">
+
+        {appState === "listening" && (
+          <>
+            <div className="absolute w-64 h-64 rounded-full border border-indigo-500/20 animate-ping" />
+            <div className="absolute w-48 h-48 rounded-full border border-indigo-500/30 animate-ping" style={{ animationDelay: '0.5s' }} />
+          </>
+        )}
+
+        {appState === "speaking" && (
+          <>
+            <div className="absolute w-72 h-72 rounded-full border-2 border-red-500/30 animate-ping" />
+            <div className="absolute w-56 h-56 rounded-full border-2 border-red-500/40 animate-ping" style={{ animationDelay: '0.3s' }} />
+          </>
+        )}
+
+        {appState === "processing" && (
+          <div className="absolute w-60 h-60 rounded-full border-4 border-yellow-500/30 border-t-yellow-400 animate-spin" />
+        )}
+
+        <div className={`
+          w-40 h-40 rounded-full transition-all duration-500
+          ${appState === "listening" && "bg-indigo-500 shadow-[0_0_100px_30px_rgba(99,102,241,0.6)] animate-pulse"}
+          ${appState === "speaking"  && "bg-red-500 shadow-[0_0_120px_40px_rgba(239,68,68,0.7)] scale-110"}
+          ${appState === "processing" && "bg-yellow-500 shadow-[0_0_100px_30px_rgba(234,179,8,0.6)]"}
+          ${appState === "starting"   && "bg-gray-700  shadow-[0_0_50px_15px_rgba(75,85,99,0.4)]"}
+          ${appState === "responding" && "bg-green-500 shadow-[0_0_100px_30px_rgba(34,197,94,0.6)] animate-pulse"}
+          ${appState === "denied"     && "bg-red-900   shadow-[0_0_50px_15px_rgba(127,29,29,0.4)]"}
+          blur-sm opacity-90
+        `} />
+      </div>
+
+      {/* Status text */}
+      <div className="absolute bottom-32 text-center w-full px-6">
+        <p className="text-gray-300 text-lg font-light tracking-wide h-7">
+          {appState === "starting"   && "Loading voice model..."}
+          {appState === "listening"  && "I'm listening"}
+          {appState === "speaking"   && "Go on..."}
+          {appState === "processing" && "Thinking..."}
+          {appState === "responding" && "Kitti is speaking..."}
+          {appState === "denied"     && "VAD failed to start"}
+        </p>
+
+        {/* User transcript */}
+        {transcript && (
+          <div className="mt-6 max-w-2xl mx-auto">
+            <p className="text-gray-500 text-xs uppercase tracking-widest mb-2">You said</p>
+            <p className="text-white text-lg italic">"{transcript}"</p>
+          </div>
+        )}
+
+        {/* Kitti's response */}
+        {response && (
+          <div className="mt-6 max-w-2xl mx-auto">
+            <p className="text-indigo-400 text-xs uppercase tracking-widest mb-2">Kitti</p>
+            <p className="text-indigo-100 text-lg">{response}</p>
+          </div>
+        )}
+
+        {message && (
+          <p className={`text-sm mt-2 max-w-md mx-auto ${appState === "denied" ? "text-red-400" : "text-green-400"}`}>
+            {message}
+          </p>
+        )}
+      </div>
+
+      {/* Backend status */}
+      <div className="absolute bottom-6 right-6 flex items-center gap-2">
+        <span className={`w-2 h-2 rounded-full ${
+          backendStatus === "kitti is alive" ? "bg-green-400 animate-pulse" : "bg-red-400"
+        }`} />
+        <span className="text-gray-600 text-xs tracking-wide">
+          {backendStatus === "kitti is alive" ? "online" : "offline"}
+        </span>
+      </div>
+
+    </div>
+  );
+}
+
+export default App;

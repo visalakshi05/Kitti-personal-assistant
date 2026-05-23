@@ -1,0 +1,14 @@
+fastapi
+uvicorn[standard]
+python-multipart
+websockets
+faster-whisper
+anthropic
+gTTS
+python-docx
+python-pptx
+openpyxl
+reportlab
+pywin32
+requests
+python-dotenv
