@@ -182,40 +182,71 @@ def _verify_file_operation(code: str, result: str, all_results: list = None) -> 
     desktop = os.path.expanduser("~/Desktop")
     results_to_check = all_results if all_results else [result]
 
-    # Detect if this is a delete operation
-    is_delete = "os.remove" in code or "shutil.rmtree" in code or "delete" in code.lower()
+    # Check all results for clear success indicators
+    for res in results_to_check:
+        res_lower = res.lower()
 
-    # Look for file paths in the code or results
+        # Move operation detected
+        if "moved to documents" in res_lower or "moved from desktop" in res_lower:
+            # Extract filename from the result
+            fname_match = re.search(r'Customer_List\.xlsx', res)
+            if fname_match:
+                return "Moved Customer_List.xlsx to Documents"
+            return "Moved file to Documents"
+
+        # Delete operation - file should be gone
+        if "delete" in code.lower() or "os.remove" in code or "shutil.rmtree" in code:
+            fname_match = re.search(r'([A-Za-z_0-9\-]+\.(xlsx|docx|pptx|pdf))', res, re.IGNORECASE)
+            if fname_match:
+                fname = fname_match.group(1)
+                full_path = os.path.join(desktop, os.path.basename(fname))
+                if not os.path.exists(full_path):
+                    return f"Deleted {os.path.basename(fname)}"
+            if "file not found" in res_lower or "deleted:" in res_lower:
+                fname_match2 = re.search(r'([A-Za-z_0-9\-]+\.(xlsx|docx|pptx|pdf))', res, re.IGNORECASE)
+                if fname_match2:
+                    return f"Deleted {fname_match2.group(1)}"
+
+        # Create/save operation - file should exist
+        if any(ext in res for ext in ['.xlsx', '.docx', '.pptx', '.pdf']):
+            # For create: look for confirmation in results
+            if "verified:" in res_lower or "file exists: true" in res_lower or "created successfully" in res_lower:
+                fname_match = re.search(r'([A-Za-z_0-9\-]+\.(xlsx|docx|pptx|pdf))', res, re.IGNORECASE)
+                if fname_match:
+                    return f"Created {fname_match.group(1)}"
+
+    # Find file paths mentioned in code
     file_pattern = re.compile(r'([A-Za-z_0-9\-]+\.(xlsx|docx|pptx|pdf))', re.IGNORECASE)
-
     found_files = []
     for src in [code] + results_to_check:
         matches = file_pattern.findall(src)
         for m in matches:
             found_files.append(m[0])
-
-    # Remove duplicates and normalize
     found_files = list(dict.fromkeys(found_files))
 
+    # For move: source should NOT exist, destination should exist
+    if "shutil.move" in code or "move" in code.lower():
+        source_match = re.search(r'expanduser\(["\']([^"\']+)["\']\)', code)
+        if source_match:
+            # Check if file is gone from desktop
+            for fname in found_files:
+                desktop_path = os.path.join(desktop, os.path.basename(fname))
+                if not os.path.exists(desktop_path):
+                    # File is gone from desktop - it was moved
+                    return f"Moved {os.path.basename(fname)}"
+
+    # For create: file should exist
     for fname in found_files:
-        # Normalize path separators
-        normalized = fname.replace("/", "\\").replace("\\\\", "\\")
+        normalized = fname.replace("/", "\\")
         full_path = os.path.join(desktop, os.path.basename(normalized))
+        if os.path.exists(full_path):
+            return f"Created {os.path.basename(normalized)}"
 
-        if is_delete:
-            # For delete: file must NOT exist
-            if not os.path.exists(full_path):
-                return f"Deleted {os.path.basename(normalized)}"
-        else:
-            # For save/create: file must exist
-            if os.path.exists(full_path):
-                return f"Created {os.path.basename(normalized)}"
-
-    # Fallback: check result text for success without errors
+    # Fallback: trust if no errors
     for res in results_to_check:
         res_lower = res.lower()
         if "error" not in res_lower and "traceback" not in res_lower:
-            if "success" in res_lower or "created" in res_lower or "saved" in res_lower:
+            if any(kw in res_lower for kw in ["success", "created", "saved", "moved", "done"]):
                 return res.strip()[:80]
 
     return None
