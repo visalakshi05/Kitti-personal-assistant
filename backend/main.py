@@ -456,40 +456,63 @@ async def websocket_endpoint(websocket: WebSocket):
 
     try:
         while True:
-            audio_bytes = await websocket.receive_bytes()
-            req_id += 1
-            print(f"\n  [req {req_id}] Audio: {len(audio_bytes)} bytes")
+            # Receive can be either bytes (audio) or text (JSON)
+            message = await websocket.receive()
 
-            if current_llm_task and not current_llm_task.done():
-                current_llm_task.cancel()
+            if "bytes" in message:
+                # === AUDIO INPUT (voice) ===
+                audio_bytes = message["bytes"]
+                req_id += 1
+                print(f"\n  [req {req_id}] Audio: {len(audio_bytes)} bytes")
+
+                if current_llm_task and not current_llm_task.done():
+                    current_llm_task.cancel()
+                    try:
+                        await current_llm_task
+                    except asyncio.CancelledError:
+                        pass
+                    transcript_queue.extend(last_pending_ref)
+                    print(f"   Request cancelled - {len(last_pending_ref)} transcript(s) re-queued")
+                    last_pending_ref = []
+
+                timestamp = datetime.now().strftime("%H%M%S")
+                filepath = os.path.join(AUDIO_DIR, f"audio_{timestamp}.wav")
+                with open(filepath, "wb") as f:
+                    f.write(audio_bytes)
+
+                print("   Transcribing...")
+                transcript = await loop.run_in_executor(None, transcribe_audio, filepath)
+                print(f"   You said: \"{transcript}\"")
+
+                if not transcript:
+                    continue
+
+                transcript_queue.append(transcript)
+                await websocket.send_text(json.dumps({"type": "transcript", "text": transcript}))
+
+                last_pending_ref = list(transcript_queue)
+                transcript_queue.clear()
+                current_llm_task = asyncio.create_task(
+                    run_llm_and_tts(websocket, last_pending_ref, req_id)
+                )
+
+            elif "text" in message:
+                # === TEXT INPUT (type box) ===
+                req_id += 1
                 try:
-                    await current_llm_task
-                except asyncio.CancelledError:
-                    pass
-                transcript_queue.extend(last_pending_ref)
-                print(f"   Request cancelled - {len(last_pending_ref)} transcript(s) re-queued")
-                last_pending_ref = []
+                    data = json.loads(message["text"])
+                    if data.get("type") == "text":
+                        text_input = data.get("text", "").strip()
+                        if text_input:
+                            print(f"\n  [req {req_id}] Text: \"{text_input}\"")
+                            await websocket.send_text(json.dumps({"type": "transcript", "text": text_input}))
 
-            timestamp = datetime.now().strftime("%H%M%S")
-            filepath = os.path.join(AUDIO_DIR, f"audio_{timestamp}.wav")
-            with open(filepath, "wb") as f:
-                f.write(audio_bytes)
-
-            print("   Transcribing...")
-            transcript = await loop.run_in_executor(None, transcribe_audio, filepath)
-            print(f"   You said: \"{transcript}\"")
-
-            if not transcript:
-                continue
-
-            transcript_queue.append(transcript)
-            await websocket.send_text(json.dumps({"type": "transcript", "text": transcript}))
-
-            last_pending_ref = list(transcript_queue)
-            transcript_queue.clear()
-            current_llm_task = asyncio.create_task(
-                run_llm_and_tts(websocket, last_pending_ref, req_id)
-            )
+                            last_pending_ref = [text_input]
+                            current_llm_task = asyncio.create_task(
+                                run_llm_and_tts(websocket, last_pending_ref, req_id)
+                            )
+                except json.JSONDecodeError:
+                    print(f"   Invalid JSON received: {message['text']}")
 
     except Exception as e:
         print(f"WebSocket closed: {e}")
