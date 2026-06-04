@@ -59,6 +59,22 @@ IMPORTANT - Rename/Delete Rules:
 - ALWAYS verify the operation succeeded with os.path.exists() before saying Done!
 - Never say a file was renamed/deleted unless you actually called the tool and verified it.
 
+IMPORTANT - File Editing Rules (formatting, fonts, colors, highlights, etc.):
+- When user asks to modify/edit/format/change an existing file: you MUST read the file first to understand its content.
+- Use run_code to open and describe the file content. Then apply the requested changes.
+- For ambiguous requests (e.g., "highlight the important part"): ask the user to clarify which part they mean, OR read the file and suggest options.
+- Apply formatting using library object properties:
+  - Word (python-docx): run.font.name, run.font.size, run.font.color.rgb, run.bold, run.highlight
+  - Excel (openpyxl): cell.font, cell.fill, cell.alignment
+  - PowerPoint (python-pptx): run.font.size, run.font.color.rgb, shape.fill
+- IMPORTANT: For editing existing files, open the file and save changes directly to the SAME filepath. Do NOT create a new file with "_Updated" suffix.
+- Use os.path.expanduser('~/Desktop/filename.ext') for all paths on Windows. NEVER use Unix paths like /mnt/c/.
+- ALWAYS verify changes were applied before saying Done!
+
+IMPORTANT - Path Format:
+- ALWAYS use: os.path.expanduser('~/Desktop/filename.ext') or 'C:\\Users\\YourName\\Desktop\\filename.ext'
+- NEVER use: /mnt/c/... or Unix-style paths
+
 If code has an error: read the error, fix the code, and call run_code again."""
 
 TTS_VOICE = "en-US-JennyNeural"
@@ -242,11 +258,31 @@ def _verify_file_operation(code: str, result: str, all_results: list = None) -> 
         if os.path.exists(full_path):
             return f"Created {os.path.basename(normalized)}"
 
+    # Check for update operations - original file or _Updated version exists
+    # Pattern: file was updated (may have been saved to new name first)
+    updated_name = None
+    for fname in found_files:
+        normalized = fname.replace("/", "\\")
+        basename = os.path.basename(normalized)
+        # Check for updated version
+        if "_Updated" in basename:
+            base_without_updated = basename.replace("_Updated", "")
+            updated_path = os.path.join(desktop, base_without_updated)
+            updated_name = base_without_updated
+            # If original name file exists (after rename), it's updated
+            if os.path.exists(updated_path):
+                return f"Updated {base_without_updated}"
+        else:
+            # Check if file exists with original name
+            full_path = os.path.join(desktop, basename)
+            if os.path.exists(full_path):
+                return f"Updated {basename}"
+
     # Fallback: trust if no errors
     for res in results_to_check:
         res_lower = res.lower()
         if "error" not in res_lower and "traceback" not in res_lower:
-            if any(kw in res_lower for kw in ["success", "created", "saved", "moved", "done"]):
+            if any(kw in res_lower for kw in ["success", "created", "saved", "moved", "done", "updated"]):
                 return res.strip()[:80]
 
     return None

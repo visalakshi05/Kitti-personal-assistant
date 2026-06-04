@@ -50,9 +50,21 @@ def get_current_time() -> str:
 
 def _patch_common_code_mistakes(code: str) -> str:
     """Fix common LLM-generated code mistakes before execution."""
+
     # Fix PP_ALIGN import — it's pp.align, not a separate import
-    code = code.replace("from pptx.enum.text import PP_ALIGN", "# PP_ALIGN removed")
-    code = code.replace("PP_ALIGN", "None  # PP_ALIGN fixed")
+    # Only remove the import line, not usage of PP_ALIGN in the code
+    import re
+    code = re.sub(r'^from pptx\.enum\.text import PP_ALIGN.*$', '# PP_ALIGN import removed', code, flags=re.MULTILINE)
+    # Replace PP_ALIGN usage with None (placeholder, actual alignment not needed for basic edits)
+    code = code.replace("PP_ALIGN.CENTER", "PP_ALIGN.CENTER")  # Keep valid usage
+    code = re.sub(r'\bPP_ALIGN\b(?![\.])', 'None', code)  # Replace standalone PP_ALIGN
+
+    # Fix RgbColor vs RGBColor - use RGBColor which is the correct import
+    code = code.replace("from pptx.dml.color import RgbColor", "from pptx.dml.color import RGBColor")
+    code = code.replace("RgbColor(", "RGBColor(")
+
+    # Fix Unix-style paths on Windows - convert /mnt/c/ to C:\
+    code = code.replace("/mnt/c/", "C:/")  # Use forward slash for cross-compat
 
     # Ensure pythoncom.CoInitialize() is called before win32com Dispatch in COM code
     lines = code.split('\n')
@@ -63,7 +75,7 @@ def _patch_common_code_mistakes(code: str) -> str:
     for line in lines:
         stripped = line.strip()
         if 'win32com.client.Dispatch' in stripped or 'win32com.client' in stripped:
-            needs_cominit = True
+            needs_coinit = True
         if needs_coinit and ('win32com.client.Dispatch' in stripped or '.Dispatch(' in stripped and 'win32com' in stripped):
             # Insert CoInitialize before this line
             if 'pythoncom.CoInitialize()' not in code:
