@@ -3,8 +3,8 @@ uvicorn[standard]
 python-multipart
 websockets
 faster-whisper
+onnxruntime
 anthropic
-gTTS
 python-docx
 python-pptx
 openpyxl
@@ -12,3 +12,6 @@ reportlab
 pywin32
 requests
 python-dotenv
+soundfile
+scipy
+piper-tts

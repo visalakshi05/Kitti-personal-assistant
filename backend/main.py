@@ -3,13 +3,31 @@ import json
 import asyncio
 import tempfile
 import time as time_module
+import threading
 from datetime import datetime
 from fastapi import FastAPI, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from faster_whisper import WhisperModel
 from anthropic import Anthropic
 from dotenv import load_dotenv
-import edge_tts
+
+# Piper TTS (local neural TTS, no network latency)
+PIPER_MODEL_PATH = os.path.join(os.path.dirname(__file__), "models", "en_US-lessac-medium.onnx")
+PIPER_CONFIG_PATH = os.path.join(os.path.dirname(__file__), "models", "en_US-lessac-medium.onnx.json")
+_piper_tts = None  # lazy-loaded, reused
+_piper_lock = threading.Lock()
+
+def _get_piper():
+    global _piper_tts
+    if _piper_tts is None:
+        with _piper_lock:
+            # Double-check after acquiring lock
+            if _piper_tts is None:
+                print("Loading Piper TTS model...")
+                from piper.voice import PiperVoice
+                _piper_tts = PiperVoice.load(PIPER_MODEL_PATH, config_path=PIPER_CONFIG_PATH)
+                print("  Piper loaded.")
+    return _piper_tts
 
 from tools.tool_registry import TOOLS, execute_tool
 
@@ -206,13 +224,41 @@ IMPORTANT - Path Format:
 
 If code has an error: read the error, fix the code, and call run_code again."""
 
-TTS_VOICE = "en-US-JennyNeural"
+
 
 async def text_to_speech(text: str) -> bytes:
-    with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
+    """
+    Generate TTS audio for `text` using Piper (local neural TTS).
+    Returns FLAC audio bytes. The frontend plays them via WebSocket as audio blobs.
+    """
+    import soundfile as sf
+    from scipy.signal import resample_poly
+
+    loop = asyncio.get_event_loop()
+    chunks = []
+    sample_rate = None
+
+    def gen():
+        nonlocal sample_rate
+        import numpy as np
+        for chunk in _get_piper().synthesize(text):
+            chunks.append(chunk.audio_float_array)
+            sample_rate = chunk.sample_rate
+        return np.concatenate(chunks)
+
+    audio_np = await loop.run_in_executor(None, gen)
+
+    # Downsample to 16kHz (telephone-quality voice, fine for speech)
+    import numpy as np
+    target_sr = 16000
+    if sample_rate != target_sr:
+        gcd = np.gcd(sample_rate, target_sr)
+        audio_np = resample_poly(audio_np, target_sr // gcd, sample_rate // gcd)
+
+    # Save as FLAC (lossless compressed, browser-native)
+    with tempfile.NamedTemporaryFile(suffix=".flac", delete=False) as tmp:
         tmp_path = tmp.name
-    communicate = edge_tts.Communicate(text, TTS_VOICE)
-    await communicate.save(tmp_path)
+    sf.write(tmp_path, audio_np, target_sr, format='FLAC')
     with open(tmp_path, "rb") as f:
         audio_bytes = f.read()
     os.unlink(tmp_path)
@@ -282,6 +328,16 @@ def summarize_old_messages(messages: list) -> str:
         }]
     )
     return extract_text_from_response(response)
+
+def _strip_markdown(text: str) -> str:
+    import re
+    text = re.sub(r'\*\*(.+?)\*\*', r'\1', text)
+    text = re.sub(r'\*(.+?)\*', r'\1', text)
+    text = re.sub(r'##?\s+', '', text)
+    text = re.sub(r'^\s*[-*+]\s+', '', text, flags=re.MULTILINE)
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    return text.strip()
+
 
 def build_system_prompt() -> str:
     if not conversation_summary:
@@ -415,6 +471,203 @@ def _verify_file_operation(code: str, result: str, all_results: list = None) -> 
                 return res.strip()[:80]
 
     return None
+# Characters that end a sentence (we yield on these)
+_SENTENCE_END = frozenset('.!?')
+
+
+async def stream_sentences(user_message: str, metrics: EvalMetrics = None):
+    """
+    Async generator. Calls Claude with streaming and yields complete
+    sentences as they are generated. Handles tool calls inline (pauses
+    sentence stream, executes tool, resumes).
+
+    Each yielded item is a dict:
+      {"type": "sentence", "text": "Hello there!"}
+      {"type": "done",     "text": "final reply string (may include last incomplete sentence)"}
+      {"type": "error",   "text": "error message"}
+    """
+    global conversation_summary
+
+    messages = list(chat_history)
+    messages.append({"role": "user", "content": user_message})
+    MAX_TOOL_CALLS = 5
+
+    for iteration in range(MAX_TOOL_CALLS):
+        buffer = ""          # accumulated tokens for current sentence
+        in_quote = False     # track whether we're inside a quoted string
+
+        try:
+            with claude_client.messages.stream(
+                model=CLAUDE_MODEL,
+                max_tokens=2048,
+                system=build_system_prompt(),
+                messages=messages,
+                tools=TOOLS,
+            ) as stream:
+                tool_calls_here = []
+
+                for event in stream:
+                    # Handle text delta events
+                    if event.type == "content_block_delta":
+                        delta = getattr(event, "delta", None)
+                        if delta is None:
+                            continue
+                        if hasattr(delta, "text"):
+                            for token in delta.text:
+                                # Track quote state to avoid breaking sentences inside quotes
+                                if token in '"\'\'':
+                                    in_quote = not in_quote
+
+                                # Yield on sentence-ending punctuation
+                                if token in _SENTENCE_END and not in_quote:
+                                    if len(buffer) > 3 or token != '.':
+                                        sentence = (buffer + token).strip()
+                                        if sentence:
+                                            yield {"type": "sentence", "text": sentence}
+                                        buffer = ""
+                                else:
+                                    buffer += token
+                                    # Safety: yield on whitespace after 80 chars
+                                    if len(buffer) > 80 and token in ' \t':
+                                        sentence = buffer.strip()
+                                        if sentence:
+                                            yield {"type": "sentence", "text": sentence}
+                                        buffer = ""
+
+                    # message stop: end of this stream turn
+                    elif event.type == "message_stop":
+                        break
+
+                # Get final message for tool call extraction
+                msg = stream.get_final_message()
+                tool_calls_here = [
+                    b for b in msg.content
+                    if b.type == "tool_use"
+                ]
+
+        except Exception as e:
+            yield {"type": "error", "text": str(e)}
+            return
+
+        if not tool_calls_here:
+            # No tool calls — stream is complete
+            break
+
+        # Handle tool calls
+        # First yield any remaining buffer as a sentence
+        if buffer.strip():
+            yield {"type": "sentence", "text": buffer.strip()}
+
+        if metrics and iteration > 0:
+            metrics.llm_retries += 1
+
+        # Execute each tool
+        tool_results = []
+        for call in tool_calls_here:
+            name = call.name
+            inpt = dict(call.input)
+            print(f"   Tool call: {name} -> {inpt}")
+
+            t_tool_start = time_module.perf_counter()
+            try:
+                result = execute_tool(name, inpt)
+            except Exception as e:
+                result = f"Tool execution error: {e}"
+            tool_duration = time_module.perf_counter() - t_tool_start
+
+            is_error = "Traceback" in result or "Error" in result or "Exception" in result
+            if metrics:
+                metrics.tool_calls.append({
+                    "name": name,
+                    "duration": tool_duration,
+                    "error": None if not is_error else result[:60]
+                })
+                if is_error:
+                    metrics.add_error(f"[{name}] {result[:80]}")
+
+            print(f"   Tool result: {result[:100]}...")
+            tool_results.append({
+                "tool_use_id": call.id,
+                "tool": name,
+                "content": result,
+            })
+
+        # For file tasks: check if verification succeeded
+        full_reply = ""
+        if _is_file_task(user_message) and tool_results:
+            last_code = None
+            for call in tool_calls_here:
+                if call.name == "run_code":
+                    last_code = call.input.get("code", "")
+            all_results = [r["content"] for r in tool_results]
+            verified = _verify_file_operation(last_code or "", "", all_results)
+            if verified:
+                full_reply = f"Done! {verified} on your Desktop."
+                chat_history.append({"role": "user", "content": user_message})
+                chat_history.append({"role": "assistant", "content": full_reply})
+                save_memory()
+                yield {"type": "done", "text": full_reply}
+                return
+
+            if metrics:
+                metrics.tool_retries += 1
+                metrics.add_error(f"File task failed verification, retry #{metrics.tool_retries}")
+
+        # Append tool results to messages and continue streaming
+        assistant_content = []
+        for block in tool_calls_here:
+            assistant_content.append({
+                "type": "tool_use",
+                "id": block.id,
+                "name": block.name,
+                "input": block.input,
+            })
+        messages.append({"role": "assistant", "content": assistant_content})
+        for res in tool_results:
+            messages.append({
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": res["tool_use_id"],
+                    "content": res["content"],
+                }]
+            })
+        messages.append({
+            "role": "user",
+            "content": (
+                "The file operation failed or did not complete. "
+                "Fix the code and call run_code again. "
+                "Verify the file exists with os.path.exists() before saying Done."
+                if _is_file_task(user_message)
+                else "Continue."
+            )
+        })
+        buffer = ""  # reset buffer after tool call
+
+    # Stream complete — yield any leftover buffer
+    if buffer.strip():
+        yield {"type": "sentence", "text": buffer.strip()}
+
+    # Build final reply for history
+    final_reply = buffer.strip() if buffer.strip() else ""
+    if not final_reply:
+        final_reply = "I'm not sure what to say. Could you rephrase that?"
+    chat_history.append({"role": "user", "content": user_message})
+    chat_history.append({"role": "assistant", "content": final_reply})
+    save_memory()
+
+    if len(chat_history) > 20:
+        old_messages = chat_history[:10]
+        new_summary = summarize_old_messages(old_messages)
+        conversation_summary = (
+            f"{conversation_summary} Later: {new_summary}"
+            if conversation_summary else new_summary
+        )
+        del chat_history[:10]
+        print(f"   Summary updated: {conversation_summary[:100]}...")
+
+    yield {"type": "done", "text": final_reply}
+
 
 def chat_with_kitti(user_message: str, metrics: EvalMetrics = None) -> str:
     global conversation_summary
@@ -616,7 +869,6 @@ async def run_llm_and_tts(websocket: WebSocket, pending_ref: list, req_id: int, 
     global _current_metrics
     transcripts = list(pending_ref)
 
-    # ── Create metrics for this request ──
     combined_transcript = transcripts[0] if len(transcripts) == 1 else " | ".join(transcripts)
     metrics = EvalMetrics(req_id, input_type, combined_transcript)
     _current_metrics = metrics
@@ -634,24 +886,22 @@ async def run_llm_and_tts(websocket: WebSocket, pending_ref: list, req_id: int, 
             user_message = " | ".join(transcripts)
             print(f"   Combined {len(transcripts)} transcripts: \"{user_message}\"")
 
-        # ── LLM ──
         print("Asking LLM...")
         t_llm_start = time_module.perf_counter()
         reply = await loop.run_in_executor(None, chat_with_kitti, user_message, metrics)
         metrics.llm_duration = time_module.perf_counter() - t_llm_start
-        print(f"   Kitti: \"{reply}\"")
+        reply_clean = _strip_markdown(reply)
+        print(f"   Kitti: \"{reply_clean[:100]}{'...' if len(reply_clean) > 100 else ''}\"")
         print(f"   LLM latency: {metrics.llm_duration:.3f}s  |  retries: {metrics.llm_retries}")
 
-        await websocket.send_text(json.dumps({"type": "response", "text": reply}))
+        await websocket.send_text(json.dumps({"type": "response", "req_id": req_id, "text": reply_clean}))
 
-        # ── TTS ──
         print("Generating speech...")
         t_tts_start = time_module.perf_counter()
-        audio_out = await text_to_speech(reply)
+        audio_out = await text_to_speech(reply_clean)
         metrics.tts_duration = time_module.perf_counter() - t_tts_start
         print(f"   TTS latency: {metrics.tts_duration:.3f}s  |  Audio: {len(audio_out)} bytes")
 
-        # ── E2E: total pipeline time (STT + LLM + TTS) ──
         total = (metrics.stt_duration or 0) + (metrics.llm_duration or 0) + (metrics.tts_duration or 0)
         metrics.e2e_duration = total
         stages = []
@@ -661,7 +911,10 @@ async def run_llm_and_tts(websocket: WebSocket, pending_ref: list, req_id: int, 
         print(f"   E2E latency: {total:.3f}s  ({' + '.join(stages)})")
 
         metrics.state = "completed"
-        await websocket.send_bytes(audio_out)
+        # Prefix audio with 4-byte req_id so frontend can discard stale audio
+        import struct
+        header = struct.pack("<I", req_id)
+        await websocket.send_bytes(header + audio_out)
 
     except asyncio.CancelledError:
         metrics.state = "interrupted"
@@ -704,7 +957,8 @@ async def websocket_endpoint(websocket: WebSocket):
                         await current_llm_task
                     except asyncio.CancelledError:
                         pass
-                    # Print eval for the interrupted request
+                    # Signal frontend to stop playing audio
+                    await websocket.send_text(json.dumps({"type": "interrupt"}))
                     print_eval_summary()
                     transcript_queue.extend(last_pending_ref)
                     print(f"   Barge-in — {len(last_pending_ref)} transcript(s) re-queued")
@@ -754,6 +1008,7 @@ async def websocket_endpoint(websocket: WebSocket):
                                     await current_llm_task
                                 except asyncio.CancelledError:
                                     pass
+                                await websocket.send_text(json.dumps({"type": "interrupt", "req_id": req_id}))
                                 print_eval_summary()
                                 print(f"   Barge-in during text request")
 

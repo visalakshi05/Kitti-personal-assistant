@@ -13,9 +13,12 @@ function App() {
 
   const websocketRef = useRef(null);
   const vadRef = useRef(null);
-  const currentAudioRef = useRef(null);   // tracks currently playing audio
-  const isRespondingRef = useRef(false);  // true while Kitti is speaking aloud
-  const isMutedRef = useRef(false);       // tracks mute state for VAD callbacks
+  const currentAudioRef = useRef(null);   // currently playing Audio object
+  const isRespondingRef = useRef(false);  // true while Kitti is speaking
+  const isMutedRef = useRef(false);       // mute state for VAD callbacks
+  const audioQueueRef = useRef([]);       // queued audio blobs waiting to play
+  const audioUrlMapRef = useRef({});       // blob URL -> object URL mapping for cleanup
+  const currentReqIdRef = useRef(0);      // tracks current request ID to discard stale audio
 
   // Health check
   useEffect(() => {
@@ -25,6 +28,34 @@ function App() {
       .catch(() => setBackendStatus("backend not reachable"));
   }, []);
 
+  // ── Audio queue helpers ──
+  const playNext = useCallback(() => {
+    if (audioQueueRef.current.length === 0) {
+      currentAudioRef.current = null;
+      isRespondingRef.current = false;
+      setAppState("listening");
+      return;
+    }
+    const { blob, url } = audioQueueRef.current.shift();
+    const audioUrl = URL.createObjectURL(blob);
+    audioUrlMapRef.current[audioUrl] = true;
+    const audio = new Audio(audioUrl);
+    currentAudioRef.current = audio;
+    setAppState("responding");
+
+    audio.onended = () => {
+      URL.revokeObjectURL(audioUrl);
+      delete audioUrlMapRef.current[audioUrl];
+      playNext();
+    };
+    audio.onerror = () => {
+      URL.revokeObjectURL(audioUrl);
+      delete audioUrlMapRef.current[audioUrl];
+      playNext();
+    };
+    audio.play().catch(() => playNext());
+  }, []);
+
   // WebSocket setup
   useEffect(() => {
     const ws = new WebSocket("ws://localhost:8000/ws");
@@ -32,26 +63,45 @@ function App() {
     ws.onmessage = (event) => {
       // Audio bytes come as Blob, text messages come as string
       if (event.data instanceof Blob) {
-        // Stop any currently playing audio first
-        if (currentAudioRef.current) {
-          currentAudioRef.current.pause();
-          currentAudioRef.current = null;
-        }
+        const headerSize = 4;
+        if (event.data.size < headerSize) return;
 
-        const audioUrl = URL.createObjectURL(event.data);
-        const audio = new Audio(audioUrl);
-        currentAudioRef.current = audio;
+        event.data.slice(0, headerSize).arrayBuffer().then((buffer) => {
+          const headerView = new DataView(buffer);
+          const audioReqId = headerView.getUint32(0, true);
 
-        audio.play();
-        isRespondingRef.current = true;   //  lock — Kitti is speaking
-        setAppState("responding");
+          // Discard audio from a previous (stale) request
+          if (audioReqId !== currentReqIdRef.current) {
+            console.log(`Discarding stale audio (req ${audioReqId}, current ${currentReqIdRef.current})`);
+            return;
+          }
 
-        audio.onended = () => {
-          URL.revokeObjectURL(audioUrl);
-          currentAudioRef.current = null;
-          isRespondingRef.current = false; //  unlock — Kitti finished
-          setAppState("listening");
-        };
+          const audioBlob = event.data.slice(headerSize);
+          const audioObj = { blob: audioBlob };
+
+          if (!currentAudioRef.current) {
+            const audioUrl = URL.createObjectURL(audioBlob);
+            audioUrlMapRef.current[audioUrl] = true;
+            const audio = new Audio(audioUrl);
+            currentAudioRef.current = audio;
+            isRespondingRef.current = true;
+            setAppState("responding");
+
+            audio.onended = () => {
+              URL.revokeObjectURL(audioUrl);
+              delete audioUrlMapRef.current[audioUrl];
+              playNext();
+            };
+            audio.onerror = () => {
+              URL.revokeObjectURL(audioUrl);
+              delete audioUrlMapRef.current[audioUrl];
+              playNext();
+            };
+            audio.play().catch(() => playNext());
+          } else {
+            audioQueueRef.current.push(audioObj);
+          }
+        }).catch(() => {});
         return;
       }
 
@@ -62,25 +112,41 @@ function App() {
           setResponse("");
         } else if (data.type === "response") {
           setResponse(data.text);
-          // stay in "processing" until audio arrives and plays
+          currentReqIdRef.current = data.req_id || 0;
         } else if (data.type === "error") {
           setMessage(data.text);
           setAppState("listening");
           setTimeout(() => setMessage(""), 2000);
+        } else if (data.type === "interrupt") {
+          if (currentAudioRef.current) {
+            currentAudioRef.current.pause();
+            currentAudioRef.current = null;
+          }
+          audioQueueRef.current = [];
+          isRespondingRef.current = false;
+          setAppState("listening");
+          currentReqIdRef.current = 0;
         }
       } catch {
         console.log("Backend says:", event.data);
       }
     };
-    ws.onclose = () => console.log("WebSocket disconnected");
-    ws.onerror = (err) => console.error("WebSocket error:", err);
     websocketRef.current = ws;
     return () => ws.close();
-  }, []);
+  }, [playNext]);
 
   // Send text message via WebSocket (bypasses VAD)
   const sendTextMessage = useCallback((text) => {
     if (websocketRef.current?.readyState === WebSocket.OPEN) {
+      // Stop Kitti's audio immediately — user is interrupting with new input
+      if (currentAudioRef.current) {
+        currentAudioRef.current.pause();
+        currentAudioRef.current = null;
+      }
+      audioQueueRef.current = [];
+      isRespondingRef.current = false;
+      setAppState("processing");
+
       // Send as JSON message with type "text"
       websocketRef.current.send(JSON.stringify({ type: "text", text }));
     }
@@ -135,15 +201,15 @@ function App() {
             // Skip if muted
             if (isMutedRef.current) return;
 
-            // Stop Kitti's audio if she is speaking
+            // Stop Kitti's audio and clear queue
             if (currentAudioRef.current) {
               currentAudioRef.current.pause();
               currentAudioRef.current = null;
-              console.log("Kitti interrupted by user!");
             }
+            audioQueueRef.current = [];  // clear pending chunks
             isRespondingRef.current = false;
+            console.log("Kitti interrupted by user!");
 
-            // Clear previous transcript/response so UI feels fresh
             setTranscript("");
             setResponse("");
             setAppState("speaking");
