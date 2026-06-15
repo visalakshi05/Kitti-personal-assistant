@@ -43,13 +43,13 @@ function App() {
         currentAudioRef.current = audio;
 
         audio.play();
-        isRespondingRef.current = true;   // 🔒 lock — Kitti is speaking
+        isRespondingRef.current = true;   //  lock — Kitti is speaking
         setAppState("responding");
 
         audio.onended = () => {
           URL.revokeObjectURL(audioUrl);
           currentAudioRef.current = null;
-          isRespondingRef.current = false; // 🔓 unlock — Kitti finished
+          isRespondingRef.current = false; //  unlock — Kitti finished
           setAppState("listening");
         };
         return;
@@ -125,7 +125,7 @@ function App() {
   useEffect(() => {
     const initVAD = async () => {
       try {
-        // Tell VAD where to find model + worklet (we copied them to /public/)
+        // Tell VAD where to find model + worklet
         const vad = await MicVAD.new({
           baseAssetPath: "/",
           onnxWASMBasePath: "/",
@@ -159,6 +159,14 @@ function App() {
             }
             console.log("Speech ended, samples:", audio.length);
             setAppState("processing");
+
+            // Send VAD speech-end timestamp BEFORE audio bytes — so backend can measure true E2E
+            if (websocketRef.current?.readyState === WebSocket.OPEN) {
+              websocketRef.current.send(JSON.stringify({
+                type: "speechEnd",
+                time: performance.now(),  // ms since page load, matches perf_counter() basis
+              }));
+            }
 
             const wavBlob = float32ToWav(audio);
             wavBlob.arrayBuffer().then((buffer) => {

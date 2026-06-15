@@ -143,7 +143,7 @@ def run_code(code: str) -> str:
             try:
                 output = future.result(timeout=30)
             except concurrent.futures.TimeoutError:
-                return "Code timed out after 30 seconds. Check for infinite loops."
+                return "Error: Code timed out after 30 seconds. Check for infinite loops."
     except Exception as e:
         return f"Execution error: {str(e)}"
 

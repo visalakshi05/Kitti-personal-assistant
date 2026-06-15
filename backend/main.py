@@ -2,6 +2,7 @@ import os
 import json
 import asyncio
 import tempfile
+import time as time_module
 from datetime import datetime
 from fastapi import FastAPI, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
@@ -13,6 +14,134 @@ import edge_tts
 from tools.tool_registry import TOOLS, execute_tool
 
 load_dotenv()
+
+# ══════════════════════════════════════════════════════════════
+#  EVAL METRICS — per-request latency + error tracking
+# ══════════════════════════════════════════════════════════════
+
+class EvalMetrics:
+    """
+    Tracks latency and errors for a single request lifecycle.
+    Print with print_eval().
+    """
+
+    def __init__(self, req_id: int, input_type: str, transcript: str = ""):
+        self.req_id = req_id
+        self.input_type = input_type          # "voice" or "text"
+        self.transcript = transcript          # what the user said
+        self.state = "active"                 # active | completed | interrupted | failed
+
+        # ── Latency buckets (seconds) ──
+        self.stt_duration     = None
+        self.llm_duration     = None
+        self.tts_duration     = None
+        self.e2e_duration     = None          # speech-end → Kitti starts speaking
+
+        # ── LLM details ──
+        self.llm_retries      = 0             # tool-call rounds / self-corrections
+        self.llm_total_tokens = 0
+
+        # ── Per-tool calls ──
+        self.tool_calls       = []            # list of {name, duration, error}
+        self.tool_errors      = 0
+        self.tool_retries     = 0
+        self.tool_timeouts    = 0
+
+        # ── Error tracking ──
+        self.errors           = []            # ["error description", ...]
+
+        # ── Timestamps ──
+        self.t_speech_end     = None          # when VAD detected end of speech
+        self.t_kitti_speaking = None          # when Kitti starts TTS playback
+
+    def stage(self, name: str):
+        """Returns a context-manager that times a block. Usage: with metrics.stage('stt'): ... """
+        return _StageContext(self, name)
+
+    def add_error(self, error: str):
+        self.errors.append(error)
+        if "timeout" in error.lower():
+            self.tool_timeouts += 1
+        self.tool_errors += 1
+
+    def print_eval(self):
+        if self.state == "active":
+            return  # don't print mid-flight
+
+        W = 60
+        print("\n" + "═" * W)
+        print(f"  EVAL  │  req#{self.req_id}  │  {self.input_type.upper()}  │  {self.state.upper()}")
+        print("─" * W)
+
+        # Latency table
+        def row(label, val):
+            if val is None:
+                print(f"  {label:<30}  —")
+            else:
+                print(f"  {label:<30}  {val:.3f}s")
+
+        print("  LATENCY")
+        row("  STT (Whisper)",            self.stt_duration)
+        row("  LLM (Claude)",              self.llm_duration)
+        row("  TTS (Edge)",               self.tts_duration)
+        row("  Total Pipeline (STT+LLM+TTS)", self.e2e_duration)
+
+        # Tool calls
+        if self.tool_calls:
+            print(f"  TOOL CALLS  ({len(self.tool_calls)} total, {self.tool_errors} errors, {self.tool_retries} retries, {self.tool_timeouts} timeouts)")
+            for i, tc in enumerate(self.tool_calls, 1):
+                status = " x" if tc["error"] else " ✓"
+                err_note = f"  [{tc['error'][:40]}]" if tc["error"] else ""
+                print(f"    {i}. {tc['name']:<30}  {tc['duration']:.3f}s{status}{err_note}")
+
+        # LLM details
+        if self.llm_retries > 0:
+            print(f"  LLM retries (self-correction): {self.llm_retries}")
+
+        # Errors
+        if self.errors:
+            print(f"  ERRORS  ({len(self.errors)})")
+            for e in self.errors:
+                print(f"    • {e[:80]}")
+        else:
+            print(f"  ERRORS:  none")
+
+        print("═" * W + "\n")
+
+
+class _StageContext:
+    """Timing context manager used by EvalMetrics.stage('name')."""
+    def __init__(self, metrics: EvalMetrics, stage_name: str):
+        self.metrics = metrics
+        self.name = stage_name
+        self._start = None
+
+    def __enter__(self):
+        self._start = time_module.perf_counter()
+        return self
+
+    def __exit__(self, *args):
+        elapsed = time_module.perf_counter() - self._start
+        attr_map = {
+            "stt": "stt_duration",
+            "llm": "llm_duration",
+            "tts": "tts_duration",
+        }
+        attr = attr_map.get(self.name)
+        if attr:
+            setattr(self.metrics, attr, elapsed)
+
+
+# Global: current metrics for the in-flight request
+_current_metrics: EvalMetrics | None = None
+
+
+def print_eval_summary():
+    """Print the active request's eval metrics if it has reached a terminal state."""
+    global _current_metrics
+    if _current_metrics and _current_metrics.state != "active":
+        _current_metrics.print_eval()
+        _current_metrics = None
 
 app = FastAPI(title="Kitti - Personal Assistant")
 
@@ -287,7 +416,7 @@ def _verify_file_operation(code: str, result: str, all_results: list = None) -> 
 
     return None
 
-def chat_with_kitti(user_message: str) -> str:
+def chat_with_kitti(user_message: str, metrics: EvalMetrics = None) -> str:
     global conversation_summary
     messages = list(chat_history)
     messages.append({"role": "user", "content": user_message})
@@ -332,12 +461,34 @@ def chat_with_kitti(user_message: str) -> str:
             messages.append({"role": "user", "content": "Please respond with a tool call."})
             continue
 
+        # Track retries (iteration 0 = first attempt, iteration > 0 = retry)
+        if metrics and iteration > 0:
+            metrics.llm_retries += 1
+
         tool_results = []
         for call in tool_calls:
             name = call.name
             inpt = dict(call.input)
             print(f"   Tool call: {name} -> {inpt}")
-            result = execute_tool(name, inpt)
+
+            t_tool_start = time_module.perf_counter()
+            try:
+                result = execute_tool(name, inpt)
+            except Exception as e:
+                result = f"Tool execution error: {e}"
+            tool_duration = time_module.perf_counter() - t_tool_start
+
+            # Check for errors in result
+            is_error = "Traceback" in result or "Error" in result or "Exception" in result
+            if metrics:
+                metrics.tool_calls.append({
+                    "name": name,
+                    "duration": tool_duration,
+                    "error": None if not is_error else result[:60]
+                })
+                if is_error:
+                    metrics.add_error(f"[{name}] {result[:80]}")
+
             print(f"   Tool result: {result[:100]}...")
             tool_results.append({
                 "tool_use_id": call.id,
@@ -365,6 +516,10 @@ def chat_with_kitti(user_message: str) -> str:
                 save_memory()
                 return final_reply
 
+            # File task failed — count as retry if we still have attempts left
+            if metrics:
+                metrics.tool_retries += 1
+
             assistant_content = []
             for block in response.content:
                 if block.type == "tool_use":
@@ -391,6 +546,8 @@ def chat_with_kitti(user_message: str) -> str:
                            "Fix the code and call run_code again. "
                            "Verify the file exists with os.path.exists() before saying Done."
             })
+            if metrics:
+                metrics.add_error(f"File task failed verification, retry #{metrics.tool_retries}")
             continue
 
         assistant_content = []
@@ -455,8 +612,19 @@ def transcribe_audio(filepath: str) -> str:
 
 transcript_queue = []
 
-async def run_llm_and_tts(websocket: WebSocket, pending_ref: list, req_id: int):
+async def run_llm_and_tts(websocket: WebSocket, pending_ref: list, req_id: int, input_type: str, t_speech_end: float = None, stt_duration: float = None):
+    global _current_metrics
     transcripts = list(pending_ref)
+
+    # ── Create metrics for this request ──
+    combined_transcript = transcripts[0] if len(transcripts) == 1 else " | ".join(transcripts)
+    metrics = EvalMetrics(req_id, input_type, combined_transcript)
+    _current_metrics = metrics
+    if t_speech_end:
+        metrics.t_speech_end = t_speech_end
+    if stt_duration:
+        metrics.stt_duration = stt_duration
+
     try:
         loop = asyncio.get_event_loop()
 
@@ -466,19 +634,46 @@ async def run_llm_and_tts(websocket: WebSocket, pending_ref: list, req_id: int):
             user_message = " | ".join(transcripts)
             print(f"   Combined {len(transcripts)} transcripts: \"{user_message}\"")
 
+        # ── LLM ──
         print("Asking LLM...")
-        reply = await loop.run_in_executor(None, chat_with_kitti, user_message)
+        t_llm_start = time_module.perf_counter()
+        reply = await loop.run_in_executor(None, chat_with_kitti, user_message, metrics)
+        metrics.llm_duration = time_module.perf_counter() - t_llm_start
         print(f"   Kitti: \"{reply}\"")
+        print(f"   LLM latency: {metrics.llm_duration:.3f}s  |  retries: {metrics.llm_retries}")
 
         await websocket.send_text(json.dumps({"type": "response", "text": reply}))
 
+        # ── TTS ──
         print("Generating speech...")
+        t_tts_start = time_module.perf_counter()
         audio_out = await text_to_speech(reply)
-        print(f"   Audio: {len(audio_out)} bytes")
+        metrics.tts_duration = time_module.perf_counter() - t_tts_start
+        print(f"   TTS latency: {metrics.tts_duration:.3f}s  |  Audio: {len(audio_out)} bytes")
+
+        # ── E2E: total pipeline time (STT + LLM + TTS) ──
+        total = (metrics.stt_duration or 0) + (metrics.llm_duration or 0) + (metrics.tts_duration or 0)
+        metrics.e2e_duration = total
+        stages = []
+        if metrics.stt_duration: stages.append(f"STT {metrics.stt_duration:.3f}s")
+        if metrics.llm_duration: stages.append(f"LLM {metrics.llm_duration:.3f}s")
+        if metrics.tts_duration: stages.append(f"TTS {metrics.tts_duration:.3f}s")
+        print(f"   E2E latency: {total:.3f}s  ({' + '.join(stages)})")
+
+        metrics.state = "completed"
         await websocket.send_bytes(audio_out)
 
     except asyncio.CancelledError:
+        metrics.state = "interrupted"
+        metrics.e2e_duration = None
         raise
+    except Exception as e:
+        metrics.state = "failed"
+        metrics.add_error(f"run_llm_and_tts exception: {e}")
+        raise
+    finally:
+        print_eval_summary()
+
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
@@ -489,6 +684,7 @@ async def websocket_endpoint(websocket: WebSocket):
     req_id = 0
     loop = asyncio.get_event_loop()
     last_pending_ref = []
+    t_speech_end = None  # timestamp when user stopped speaking
 
     try:
         while True:
@@ -496,19 +692,22 @@ async def websocket_endpoint(websocket: WebSocket):
             message = await websocket.receive()
 
             if "bytes" in message:
-                # === AUDIO INPUT (voice) ===
+                # === VOICE INPUT ===
                 audio_bytes = message["bytes"]
                 req_id += 1
                 print(f"\n  [req {req_id}] Audio: {len(audio_bytes)} bytes")
 
+                # ── Handle barge-in: cancel any in-flight request ──
                 if current_llm_task and not current_llm_task.done():
                     current_llm_task.cancel()
                     try:
                         await current_llm_task
                     except asyncio.CancelledError:
                         pass
+                    # Print eval for the interrupted request
+                    print_eval_summary()
                     transcript_queue.extend(last_pending_ref)
-                    print(f"   Request cancelled - {len(last_pending_ref)} transcript(s) re-queued")
+                    print(f"   Barge-in — {len(last_pending_ref)} transcript(s) re-queued")
                     last_pending_ref = []
 
                 timestamp = datetime.now().strftime("%H%M%S")
@@ -517,23 +716,29 @@ async def websocket_endpoint(websocket: WebSocket):
                     f.write(audio_bytes)
 
                 print("   Transcribing...")
+                t_stt_start = time_module.perf_counter()
                 transcript = await loop.run_in_executor(None, transcribe_audio, filepath)
+                stt_duration = time_module.perf_counter() - t_stt_start
                 print(f"   You said: \"{transcript}\"")
+                print(f"   STT latency: {stt_duration:.3f}s")
 
                 if not transcript:
                     continue
 
+                # t_speech_end comes from frontend (VAD speech-end time, sent as part of audio metadata)
+                # If not provided, fall back to after STT completes (old behavior, undercounts E2E)
                 transcript_queue.append(transcript)
                 await websocket.send_text(json.dumps({"type": "transcript", "text": transcript}))
 
                 last_pending_ref = list(transcript_queue)
                 transcript_queue.clear()
+
                 current_llm_task = asyncio.create_task(
-                    run_llm_and_tts(websocket, last_pending_ref, req_id)
+                    run_llm_and_tts(websocket, last_pending_ref, req_id, "voice", t_speech_end, stt_duration)
                 )
 
             elif "text" in message:
-                # === TEXT INPUT (type box) ===
+                # === TEXT INPUT ===
                 req_id += 1
                 try:
                     data = json.loads(message["text"])
@@ -541,12 +746,28 @@ async def websocket_endpoint(websocket: WebSocket):
                         text_input = data.get("text", "").strip()
                         if text_input:
                             print(f"\n  [req {req_id}] Text: \"{text_input}\"")
-                            await websocket.send_text(json.dumps({"type": "transcript", "text": text_input}))
 
+                            # ── Handle barge-in for text too ──
+                            if current_llm_task and not current_llm_task.done():
+                                current_llm_task.cancel()
+                                try:
+                                    await current_llm_task
+                                except asyncio.CancelledError:
+                                    pass
+                                print_eval_summary()
+                                print(f"   Barge-in during text request")
+
+                            await websocket.send_text(json.dumps({"type": "transcript", "text": text_input}))
+                            t_speech_end = time_module.perf_counter()
                             last_pending_ref = [text_input]
+
                             current_llm_task = asyncio.create_task(
-                                run_llm_and_tts(websocket, last_pending_ref, req_id)
+                                run_llm_and_tts(websocket, last_pending_ref, req_id, "text", t_speech_end)
                             )
+                    elif data.get("type") == "speechEnd":
+                        # Frontend sends VAD speech-end timestamp — stored for future use
+                        # when time-base synchronization is implemented
+                        pass
                 except json.JSONDecodeError:
                     print(f"   Invalid JSON received: {message['text']}")
 
@@ -554,3 +775,4 @@ async def websocket_endpoint(websocket: WebSocket):
         print(f"WebSocket closed: {e}")
         if current_llm_task and not current_llm_task.done():
             current_llm_task.cancel()
+            print_eval_summary()
